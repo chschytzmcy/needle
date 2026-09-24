@@ -95,3 +95,5 @@ needle-ui.*
 *.vocab 
 *.model
 *.cact
+# docker 构建缓存 (引擎 .so + 权重, 用 docker/prepare-cache.sh 生成)
+docker-cache/

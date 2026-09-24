@@ -1,0 +1,22 @@
+services:
+  needle-cn:
+    build: .
+    image: needle-cn:latest
+    container_name: needle-cn
+    ports:
+      - "7860:7860"
+    environment:
+      NEEDLE_HOST: "0.0.0.0"
+      NEEDLE_PORT: "7860"
+      # 换微调权重示例:
+      # NEEDLE_WEIGHTS: /weights/my_tuned.cact
+    # volumes:
+    #   - ./my_tuned.cact:/weights/my_tuned.cact:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3

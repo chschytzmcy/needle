@@ -1,0 +1,24 @@
+# 镜像里用不到的都排除; docker-cache/ 要保留 (Dockerfile COPY 它)
+.git/
+__pycache__/
+*.py[codz]
+*.egg-info/
+*.so
+!docker-cache/**/*.so
+build/
+dist/
+tests/
+assets/
+setup/
+setup.bat
+docker-compose.yml
+.dockerignore
+.gitignore
+API.md
+TEST_REPORT.md
+llms.txt
+requirements-train.txt
+*.cact
+!docker-cache/**/*.cact
+
+# 注意: pyproject.toml 引用 README.md, 不能排除

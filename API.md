@@ -165,6 +165,84 @@ def _cn_grounding_per_test():
     cn_grounding.uninstall()
 ```
 
+### 4.5 Docker 部署（推荐生产形态）
+
+镜像 `needle-cn:latest`（约 198 MB）完全自包含：引擎 `libneedle.so` + 权重
+`needle3.cact`（约 36 MB）在构建期烘入 `/root/.cache/cactus-needle/v3/3.0.1/`，
+**运行期零 HF 依赖**（已实测容器到 huggingface.co 不通仍可正常服务）。
+
+#### 文件布局
+
+| 文件 | 用途 |
+|---|---|
+| `Dockerfile` | python:3.12-slim + needle + 中文插件 + 缓存预烘；构建期 sed 把镜像内 `ENGINE_VERSIONS[3]` 钉为 3.0.1（上游 3.0.2 wheel 在 HF 上不存在） |
+| `docker-compose.yml` | 端口 7860、healthcheck、`restart: unless-stopped` |
+| `docker/entrypoint.sh` | 入口；支持环境变量覆盖 |
+| `docker/prepare-cache.sh` | 从本机 `~/.cache/cactus-needle/v3/3.0.1` 刷新构建缓存（不进 git） |
+
+#### 构建与启动
+
+```bash
+# 首次: 本机先跑过一次 needle (使 ~/.cache 里有引擎), 再刷新构建缓存
+./docker/prepare-cache.sh
+
+# 一键起服务
+docker compose up -d --build
+
+# 验证
+curl -s http://127.0.0.1:7860/ -o /dev/null -w "%{http_code}\n"   # 200
+```
+
+#### 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `NEEDLE_HOST` | `0.0.0.0` | 监听地址 |
+| `NEEDLE_PORT` | `7860` | 监听端口 |
+| `NEEDLE_WEIGHTS` | （空=基础权重） | 微调 `.cact` 路径，配合卷挂载：`-v ./tuned.cact:/weights/tuned.cact -e NEEDLE_WEIGHTS=/weights/tuned.cact` |
+
+#### HTTP 契约
+
+`POST /complete`，body `{query, tools}`；响应 envelope 含
+`function_calls` / `validation.ungrounded`（中文 grounding 结果）。示例：
+
+```bash
+curl -s -X POST http://127.0.0.1:7860/complete \
+  -H "Content-Type: application/json" \
+  -d '{"query": "把厨房灯调暗到30",
+       "tools": [{"name":"set_lights","description":"控制灯",
+                  "parameters":{"type":"object",
+                                "properties":{"room":{"type":"string"},
+                                              "brightness":{"type":"integer"}},
+                                "required":["room","brightness"]}}]}'
+# → function_calls: [{room: 厨房, brightness: 30}], ungrounded: []
+```
+
+#### 镜像内回归
+
+```bash
+docker run --rm --entrypoint sh \
+  -v $PWD/tests:/tests:ro -v $PWD/cn_grounding.py:/app/cn_grounding.py:ro \
+  needle-cn -c "pip install -q pytest pydantic && python -m pytest /tests -q"
+# → 87 passed
+```
+
+#### 实测性能（CPU，容器内）
+
+| 指标 | 数值 |
+|---|---|
+| prefill | 436–491 tok/s |
+| decode | 207–213 tok/s |
+| 峰值内存 | 102 MB |
+| 单请求延迟 | < 1 s |
+| 容器启动到 healthy | < 10 s |
+
+#### 注意事项
+
+- 宿主 `7860` 若被占（如本地跑过 `scripts_run_playground.py`），先停掉或改 `docker-compose.yml` 端口映射。
+- 上游 `ENGINE_VERSIONS[3]="3.0.2"` 的修复在**构建期 sed** 完成；若未来 HF 发布 3.0.2 wheel，删掉该 sed 并同步更新 `scripts_run_playground.py` 的补丁条件即可。
+- `docker-cache/` 已在 `.gitignore`，clone 后镜像构建前需先执行 `prepare-cache.sh`（或让容器首拉走 HF，需网络）。
+
 ---
 
 ## 5. 行为变更对照表
@@ -329,4 +407,5 @@ if __name__ == "__main__":
 - 项目仓库：`git@github.com:chschytzmcy/needle.git`
 - 测试报告：`TEST_REPORT.md`
 - 源码：`cn_grounding.py`（283 行，含详细注释）
+- Docker 部署：`Dockerfile` / `docker-compose.yml` / `docker/`（见 4.5 节）
 - 测试用例：`tests/test_cn_grounding.py` (41) + `tests/test_cn_grounding_integration.py` (14)
