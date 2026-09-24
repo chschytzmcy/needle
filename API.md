@@ -167,17 +167,28 @@ def _cn_grounding_per_test():
 
 ### 4.5 Docker 部署（推荐生产形态）
 
-镜像 `needle-cn:latest`（约 198 MB）完全自包含：引擎 `libneedle.so` + 权重
+镜像 `needle-cn:latest` 完全自包含：引擎 `libneedle.so` + 权重
 `needle3.cact`（约 36 MB）在构建期烘入 `/root/.cache/cactus-needle/v3/3.0.1/`，
 **运行期零 HF 依赖**（已实测容器到 huggingface.co 不通仍可正常服务）。
+
+**一个镜像，两种服务**（`NEEDLE_SERVICE` 切换）：
+
+| 服务 | 端口 | 端点 | 面向 |
+|---|---|---|---|
+| `playground`（默认） | 7860 | 浏览器 UI + `POST /complete` + `/reset` `/load-model` | 人：演示、试 schema |
+| `extract` | 8081 | `GET /health` + `POST /extract` | 程序：业务集成后端 |
+
+`extract` 契约：非法 body → 422；engine 忙（锁排队 >10s）→ 503；暖机未完成
+`/health` → 503（供调用方 circuit breaker 探测）；不记 query 内容；响应带
+`validation.ungrounded` + `latency_ms`。两个服务中文栈一致（grounding + P1）。
 
 #### 文件布局
 
 | 文件 | 用途 |
 |---|---|
-| `Dockerfile` | python:3.12-slim + needle + 中文插件 + 缓存预烘；构建期 sed 把镜像内 `ENGINE_VERSIONS[3]` 钉为 3.0.1（上游 3.0.2 wheel 在 HF 上不存在） |
-| `docker-compose.yml` | 端口 7860、healthcheck、`restart: unless-stopped` |
-| `docker/entrypoint.sh` | 入口；支持环境变量覆盖 |
+| `Dockerfile` | python:3.12-slim + needle`[http]` + 中文插件 + 缓存预烘；构建期 sed 把镜像内 `ENGINE_VERSIONS[3]` 钉为 3.0.1（上游 3.0.2 wheel 在 HF 上不存在） |
+| `docker-compose.yml` | 双服务：`needle-cn`(7860) + `needle-http`(8081)，各自 healthcheck、restart |
+| `docker/entrypoint.sh` | `NEEDLE_SERVICE=playground\|extract` 分支入口；环境变量覆盖 |
 | `docker/prepare-cache.sh` | 从本机 `~/.cache/cactus-needle/v3/3.0.1` 刷新构建缓存（不进 git） |
 
 #### 构建与启动
@@ -186,24 +197,27 @@ def _cn_grounding_per_test():
 # 首次: 本机先跑过一次 needle (使 ~/.cache 里有引擎), 再刷新构建缓存
 ./docker/prepare-cache.sh
 
-# 一键起服务
+# 一键起双服务 (playground + extract)
 docker compose up -d --build
 
 # 验证
-curl -s http://127.0.0.1:7860/ -o /dev/null -w "%{http_code}\n"   # 200
+curl -s http://127.0.0.1:7860/ -o /dev/null -w "%{http_code}\n"        # 200 (UI)
+curl -s http://127.0.0.1:8081/health                                    # {"status":"ok",...}
 ```
 
 #### 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
+| `NEEDLE_SERVICE` | `playground` | `playground`（UI + /complete）或 `extract`（/health + /extract 业务后端） |
 | `NEEDLE_HOST` | `0.0.0.0` | 监听地址 |
-| `NEEDLE_PORT` | `7860` | 监听端口 |
+| `NEEDLE_PORT` | playground 7860 / extract 8081 | 监听端口 |
 | `NEEDLE_WEIGHTS` | （空=基础权重） | 微调 `.cact` 路径，配合卷挂载：`-v ./tuned.cact:/weights/tuned.cact -e NEEDLE_WEIGHTS=/weights/tuned.cact` |
+| `NEEDLE_TELEMETRY` | — | `0` 关闭匿名使用计数（needle-http 脚本内已默认关闭） |
 
 #### HTTP 契约
 
-`POST /complete`，body `{query, tools}`；响应 envelope 含
+**playground** `POST /complete`，body `{query, tools}`；响应 envelope 含
 `function_calls` / `validation.ungrounded`（中文 grounding 结果）。示例：
 
 ```bash
@@ -216,6 +230,22 @@ curl -s -X POST http://127.0.0.1:7860/complete \
                                               "brightness":{"type":"integer"}},
                                 "required":["room","brightness"]}}]}'
 # → function_calls: [{room: 厨房, brightness: 30}], ungrounded: []
+```
+
+**extract** `POST /extract`，body `{query, tools, system?, max_new_tokens?}`；
+额外保证：422（非法 body）/ 503（engine 忙、暖机中）/ `latency_ms` 字段；
+CJK query 自动过 P1 归一化（`三十`→`30`）。示例：
+
+```bash
+curl -s -X POST http://127.0.0.1:8081/extract \
+  -H "Content-Type: application/json" \
+  -d '{"query": "把厨房灯调暗到三十",
+       "tools": [{"name":"set_lights","description":"Set room light brightness",
+                  "parameters":{"type":"object",
+                                "properties":{"room":{"type":"string"},
+                                              "brightness":{"type":"integer"}},
+                                "required":["room","brightness"]}}]}'
+# → brightness=30 (P1 归一化生效), ungrounded=[], latency_ms≈500
 ```
 
 #### 镜像内回归

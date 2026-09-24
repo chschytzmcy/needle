@@ -1,3 +1,7 @@
+# 一个镜像, 两种服务 (NEEDLE_SERVICE 切换):
+#   needle-cn    :7860  playground   浏览器 UI + POST /complete      (人用/演示)
+#   needle-http  :8081  extract      GET /health + POST /extract     (业务后端)
+# 两者共用同一 needle3 引擎 + cn_grounding + P1, 各自独立进程/独立锁。
 services:
   needle-cn:
     build: .
@@ -6,6 +10,7 @@ services:
     ports:
       - "7860:7860"
     environment:
+      NEEDLE_SERVICE: "playground"
       NEEDLE_HOST: "0.0.0.0"
       NEEDLE_PORT: "7860"
       # 换微调权重示例:
@@ -19,4 +24,26 @@ services:
       interval: 30s
       timeout: 5s
       start_period: 20s
+      retries: 3
+
+  needle-http:
+    image: needle-cn:latest      # 同镜像; 需要重建时把 build: . 也加上
+    build: .
+    container_name: needle-http
+    ports:
+      - "8081:8081"
+    environment:
+      NEEDLE_SERVICE: "extract"
+      NEEDLE_HOST: "0.0.0.0"
+      NEEDLE_PORT: "8081"
+      NEEDLE_TELEMETRY: "0"      # 隐私: 不发匿名计数
+      # NEEDLE_WEIGHTS: /weights/my_tuned.cact
+    restart: unless-stopped
+    healthcheck:
+      # /health 暖机完成前返回 503 → urlopen 抛 HTTPError → unhealthy, 语义与调用方 breaker 一致
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
       retries: 3
