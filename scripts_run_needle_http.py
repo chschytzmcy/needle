@@ -128,6 +128,10 @@ async def extract(request: Request):
     except (json.JSONDecodeError, ValueError):
         return JSONResponse(status_code=422,
                             content={"error": "body must be valid JSON"})
+    if not isinstance(body, dict):
+        # body 是合法 JSON 但不是对象 (如 `null` / `[...]` / `42`)
+        return JSONResponse(status_code=422,
+                            content={"error": "body must be a JSON object"})
     query = body.get("query")
     tools = body.get("tools")
     if not isinstance(query, str) or not query:
