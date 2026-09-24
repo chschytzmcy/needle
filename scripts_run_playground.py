@@ -24,9 +24,23 @@ if _fetch.ENGINE_VERSIONS[3] == "3.0.2":
     _fetch.ENGINE_VERSIONS[3] = "3.0.1"
 
 # ── 2. 装中文 grounding 插件 ──
+import needle
 import cn_grounding
 cn_grounding.install()
 print(f"[boot] cn_grounding installed: {cn_grounding.is_installed()}", file=sys.stderr)
+
+# ── 2b. P1 中文数字归一化接进推理入口 (三十→30, 纯规则 ~0ms) ──
+# Needle._complete 是 complete()/run() 的公共漏斗, patch 这一层两条路径都覆盖;
+# grounding 补丁管"不放行捏造", P1 管"让引擎本来就能填对"。
+import re as _re
+_CJK_RE = _re.compile(r"[㐀-鿿]")
+_orig_complete = needle.Needle._complete
+def _p1_complete(self, text, max_new_tokens=512, **kw):
+    if text and _CJK_RE.search(text):
+        text = cn_grounding.normalize_cn_numbers(text)
+    return _orig_complete(self, text, max_new_tokens, **kw)
+needle.Needle._complete = _p1_complete
+print("[boot] P1 normalize_cn_numbers wired into Needle._complete", file=sys.stderr)
 
 # ── 3. 调项目自带的 playground CLI (它会拉引擎 + 启 Flask) ──
 import argparse
