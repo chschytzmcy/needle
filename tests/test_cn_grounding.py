@@ -249,3 +249,55 @@ class TestRegressionEnglishGrounding:
 
     def test_today_english(self, patched):
         assert patched._relative_cue("today") is True
+
+
+# ── P1 数字归一化 (normalize_cn_numbers) ───────────────────────
+
+
+class TestNormalizeCnNumbers:
+    """P1 预处理:中文数字 → 阿拉伯数字,纯规则零模型。"""
+
+    def test_plain_number(self):
+        from cn_grounding import normalize_cn_numbers
+        assert normalize_cn_numbers("把客厅灯调暗到三十") == "把客厅灯调暗到30"
+        assert normalize_cn_numbers("三百五十") == "350"
+        assert normalize_cn_numbers("三万五千") == "35000"
+        assert normalize_cn_numbers("十") == "10"
+
+    def test_decimal(self):
+        from cn_grounding import normalize_cn_numbers
+        assert normalize_cn_numbers("三点五折") == "3.5折"
+        assert normalize_cn_numbers("三十点五") == "30.5"
+
+    def test_percentage(self):
+        from cn_grounding import normalize_cn_numbers
+        assert normalize_cn_numbers("百分之三十") == "30%"
+        assert normalize_cn_numbers("千分之五") == "0.5%"
+
+    def test_digit_chain_year_untouched(self):
+        """逐位念的年份(二零二四)不能按位值 parse 成 4 —— 保持原样。"""
+        from cn_grounding import normalize_cn_numbers
+        assert normalize_cn_numbers("二零二四年三月五日提交") == "二零二四年三月五日提交"
+        assert normalize_cn_numbers("一二三号") == "一二三号"
+
+    def test_single_digit_measure_words_untouched(self):
+        """单字数字是量词/程度/名字成分,不能重写:
+        '一条消息'→'1条消息' 会让翻译器把'张三'变'张3'(实测 eval 教训)。"""
+        from cn_grounding import normalize_cn_numbers
+        assert normalize_cn_numbers("给张三发一条消息") == "给张三发一条消息"
+        assert normalize_cn_numbers("查一下上海的天气") == "查一下上海的天气"
+        assert normalize_cn_numbers("稍微亮一点") == "稍微亮一点"
+
+    def test_arabic_passthrough(self):
+        from cn_grounding import normalize_cn_numbers
+        assert normalize_cn_numbers("调暗到30") == "调暗到30"
+        assert normalize_cn_numbers("2024-03-05") == "2024-03-05"
+
+    def test_empty_and_none(self):
+        from cn_grounding import normalize_cn_numbers
+        assert normalize_cn_numbers("") == ""
+        assert normalize_cn_numbers(None) is None
+
+    def test_mixed(self):
+        from cn_grounding import normalize_cn_numbers
+        assert normalize_cn_numbers("把音量调到五十,现在是30") == "把音量调到50,现在是30"

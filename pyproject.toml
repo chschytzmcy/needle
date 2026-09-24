@@ -20,6 +20,7 @@ train = [
   "sentencepiece"
 ]
 gpu = ["jax[cuda12]"]
+http = ["fastapi>=0.110", "uvicorn>=0.29"]
 metal = [
     "jax==0.4.38",
     "jaxlib==0.4.38",

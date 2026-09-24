@@ -183,6 +183,55 @@ _CN_RELATIVE_RE = re.compile(
 _ORIG_ATTRS = ("_source_years", "_source_numbers", "_relative_cue")
 
 
+def _fmt_decimal(d: decimal.Decimal) -> str:
+    """Decimal → 干净的数字串: '30' 而不是 '3E+1' / '30.00'。"""
+    n = d.normalize()
+    if n == n.to_integral_value():
+        return str(n.quantize(decimal.Decimal(1)))
+    return str(n)
+
+
+def normalize_cn_numbers(text: str) -> str:
+    """P1 输入预处理: 中文数字 → 阿拉伯数字(纯规则, ~0ms, 零模型)。
+
+    needle 的英文/数字 grounding 是原生强项, 中文数字不是 —— 与其让
+    翻译模型处理数字(小模型高发错误), 不如规则归一化后再进 needle:
+
+      "把客厅灯调暗到三十"      → "把客厅灯调暗到30"
+      "百分之三十"              → "30%"
+      "三百五十"                → "350"
+      "三点五折"                → "3.5折"
+      "二零二四年"              → 不动(年份由 _cn_extract_years grounding 兜)
+
+    只重写 _CN_NUM_RE 命中且可解析的片段; 解析失败原样保留。
+    与 install() 互补: 归一化让 needle 更容易提取正确,
+    grounding patch 让 needle 不误杀正确输出。
+    """
+    if not text:
+        return text
+
+    _UNIT_CHARS = set("十拾百佰千仟万萬亿億")
+
+    def _repl(m: "re.Match[str]") -> str:
+        s = m.group(0)
+        # 保守归一化: 只重写"确定是数量"的片段 —— 含位值单位(三十/三百五十)、
+        # 含小数点(三点五)、或百分比前缀(百分之三十)。
+        # 跳过: digit-chain("二零二四"年份逐位念,按位值 parse 得 4 是错的)、
+        # 单字数字("一条/一下/一点"是量词/程度,"张三"的"三"是名字成分)——
+        # 这些交给 cn_grounding 的 grounding 补丁兜底,不在输入层重写。
+        is_pct = s.startswith(("百分之", "千分之"))
+        if not (is_pct or ("点" in s) or (set(s) & _UNIT_CHARS)):
+            return s
+        val = _parse_cn_number(s)
+        if val is None:
+            return s
+        if is_pct:
+            return _fmt_decimal(val * decimal.Decimal(100)) + "%"
+        return _fmt_decimal(val)
+
+    return _CN_NUM_RE.sub(_repl, text)
+
+
 def install() -> None:
     """把 needle 的三个 grounding 函数替换为中文增强版本。
 
