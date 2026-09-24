@@ -830,3 +830,26 @@ docker run --rm --entrypoint sh \
 | decode | 207–213 tok/s | ~222 tok/s |
 | 峰值内存 | 102 MB | 124.5 MB |
 | 启动到 healthy | < 10s | 暖机 0.2s |
+
+---
+
+## 15. 双服务终态验证（2026-09-24，稳定运行后复检）
+
+容器上线 12 分钟后复检，两服务均 `(healthy)`，全部通过：
+
+| 检查 | playground :7860 | needle-http :8081 |
+|---|---|---|
+| 容器状态 | Up 12min (healthy) | Up 12min (healthy) |
+| 存活端点 | `GET /` → 200（0.8ms） | `/health` → ok，`model_loaded=true`，`cn_grounding=true` |
+| 英文基线 | `dim kitchen to 30` → `{room: kitchen, brightness: 30}`，ungrounded=[] | 同输入 → 同结果，455ms |
+| 中文 P1 | `把客厅灯调暗到三十` → `{room: 把客厅灯, brightness: 30}`（实体也抽对了） | `把厨房灯调暗到百分之三十` → `brightness=30`，481ms |
+| 错误契约 | — | 空 query → HTTP 422 |
+
+要点：
+
+- **两段式 P1 生效链**在 extract 实测：`百分之三十` → P1 → `30%` → 引擎 → `brightness=30`，归一化与数值提取串接正确。
+- **实体拷贝波动复现**：同型句式在 playground 侧抽出干净 `room=把客厅灯`，extract 侧则把整句塞进 `room`——与 §9 记录一致（引擎行为，数值侧始终稳定、`ungrounded` 均空），不构成缺陷。
+- 两服务独立进程/独立引擎锁互不影响；`/health` 的 `extract_count` 跨请求累计正常。
+- 复测命令同 §13/§14（curl 模板不变）。
+
+**终态结论**：88/88 grounding 测试、双服务 HTTP 契约、离线镜像、中文栈（grounding + P1）全部按文档描述工作，`main` = `1d324f4`+，交付状态与 API.md/TEST_REPORT.md 一致。
