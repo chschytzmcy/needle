@@ -2,8 +2,8 @@
 
 > 项目：`cactus-needle` (`chschytzmcy/needle` fork)
 > 分支：`main`
-> 报告日期：2026-09-24
-> 测试范围：单元测试 + 集成测试 + HTTP playground 端到端
+> 报告日期：2026-09-24（更新：P1 归一化 + needle-http + Docker 双服务）
+> 测试范围：单元测试 + 集成测试 + HTTP playground 端到端 + extract 服务 + Docker 双服务
 
 ---
 
@@ -16,8 +16,9 @@
 | 中文数字 (`三十`、`一百二十三`、`百分之三十`) | `_source_numbers` 无法识别 | Decimal(30) / 123 / 0.30 被识别 |
 | 中文日期 (`二零二四年三月五日`) | `_source_years` 返回空集 | `{2024}` 被识别 |
 | 中文相对时间 (`明天`、`上周五`) | `_relative_cue` 返回 False | True，许可 system 日期 |
+| P1 输入归一化 (`normalize_cn_numbers`) | —（新增能力） | 进引擎前 `三十`→`30`，引擎可正确填值 |
 
-同时确保**不破坏英文 grounding 行为**。
+同时确保**不破坏英文 grounding 行为**。范围决策：中文能力 = grounding 安全网 + P1 归一化，不含运行时翻译与微调。
 
 ---
 
@@ -26,11 +27,11 @@
 | 测试文件 | 用例数 | 通过 | 失败 |
 |---------|------|----|----|
 | `tests/test_grounding.py` | 25 | 25 | 0 |
-| `tests/test_cn_grounding.py` | 41 | 41 | 0 |
+| `tests/test_cn_grounding.py` | 49 | 49 | 0 |
 | `tests/test_cn_grounding_integration.py` | 14 | 14 | 0 |
-| **合计** | **80** | **80** | **0** |
+| **grounding 合计** | **88** | **88** | **0** |
 
-执行耗时：0.61s
+全仓测试套：`python3 -m pytest tests/ -q` → **227 passed, 6 skipped**（skip 为需真实引擎/网络的 slow 用例）。
 
 执行命令：
 ```bash
@@ -81,6 +82,30 @@ python3 -m pytest tests/test_grounding.py tests/test_cn_grounding.py \
 | 9 | `""` | None | None | ✅ |
 | 10 | `"混入了英文abc"` | None | None | ✅ |
 | 11 | `"零"` | Decimal(0) | Decimal(0) | ✅ |
+
+### 3.3 P1 归一化 `normalize_cn_numbers`（进引擎前的输入层）
+
+重写原则：只动"确定是数量"的片段（含位值单位/小数点/百分比前缀），保守跳过逐字年份链、单字量词、人名数字。
+
+| # | 输入 | 期望输出 | 类别 | 通过 |
+|---|------|--------|------|----|
+| 1 | `"把客厅灯调暗到三十"` | `"把客厅灯调暗到30"` | 普通改写 | ✅ |
+| 2 | `"三百五十"` | `"350"` | 普通改写 | ✅ |
+| 3 | `"三万五千"` | `"35000"` | 普通改写 | ✅ |
+| 4 | `"十"` | `"10"` | 普通改写 | ✅ |
+| 5 | `"三点五折"` | `"3.5折"` | 小数+后缀保留 | ✅ |
+| 6 | `"三十点五"` | `"30.5"` | 小数 | ✅ |
+| 7 | `"百分之三十"` | `"30%"` | 百分比 | ✅ |
+| 8 | `"千分之五"` | `"0.5%"` | 千分比 | ✅ |
+| 9 | `"二零二四年三月五日提交"` | **原样不动** | 逐字年份链保护 | ✅ |
+| 10 | `"一二三号"` | **原样不动** | 逐字编号保护 | ✅ |
+| 11 | `"给张三发一条消息"` | **原样不动** | 量词"一条"不误伤 | ✅ |
+| 12 | `"查一下上海的天气"` | **原样不动** | "一下"不误伤 | ✅ |
+| 13 | `"稍微亮一点"` | **原样不动** | "一点"不误伤 | ✅ |
+| 14 | `"调暗到30"` | `"调暗到30"` | 阿拉伯直通 | ✅ |
+| 15 | `"2024-03-05"` | `"2024-03-05"` | ISO 日期直通 | ✅ |
+| 16 | `"把音量调到五十,现在是30"` | `"把音量调到50,现在是30"` | 混合只改中文段 | ✅ |
+| 17 | `""` / `None` | `""` / `None` | 边界 | ✅ |
 
 ---
 
@@ -361,6 +386,19 @@ Content-Type: application/json
 
 **结论**：⚠️ 引擎填了 `brightness=100`（与 query 矛盾），被 grounding 拦截。补丁的 `_source_numbers("把厨房灯调暗到三十")` 能正确抽出 `{30}`，但引擎本身的分词器无法把 `三十` 解码为 `30` 填入 brightness。这是**引擎训练数据为英文**导致的局限，不是 grounding bug。
 
+**P1 接线后复测（同日，同一 query，Docker 容器内 `/complete`）**：
+
+```json
+// 响应 (P1 已在 Needle._complete 入口把 三十→30)
+{
+  "function_calls": [{"name": "set_lights",
+                      "arguments": {"room": "把厨房灯调暗到30", "brightness": 30}}],
+  "validation": {"ungrounded": []}
+}
+```
+
+✅ 数值不再捏造、不再触发拦截（对比上表：100→30）。残留：`room` 被塞整句——引擎实体拷贝弱点，属已知限制（§9），非本项目范围。
+
 ### 8.3 中文日期 grounding
 
 **curl 命令**：
@@ -577,22 +615,26 @@ def needle_complete(self, text, *args):
 
 ## 9. 已知限制
 
-| 限制 | 描述 | 影响范围 |
-|------|----|--------|
-| 引擎中文理解 | Needle 3 训练数据以英文为主，分词器对中文数字字面量解码弱 | 纯中文数字 query 时引擎易填错 |
-| Ungrounded 字段无法删除 | `_annotate_ungrounded` 只追加 ungrounded 路径，不删除引擎已标记的 | 引擎错误标记无法被补丁赦免 |
-| ISO 日期过滤 | `_patched_source_numbers` 会跳过 `YYYY-MM-DD` 以免误读 | 这是设计选择，非缺陷 |
+| 限制 | 描述 | 现状 |
+|------|----|------|
+| ~~引擎不理解中文数字~~ | 分词器中文走 byte-fallback（1 汉字=3 token，无语义） | **已由 P1 缓解**（§3.3、§8.2 复测）；长尾句式仍不稳 |
+| 中文实体拷贝不稳 | 同型 query 下 `room` 有时正确抽出`厨房`、有时塞入整句 | 引擎行为，范围决策内不做处理；数值有 grounding 兜底，实体是字符串无对错判据 |
+| 纯中文长句工具选择 | 引擎可能整句拒调（当"翻译请求"） | 范围决策：语言侧由调用方负责；grounding 保证拒调≠误放行 |
+| Ungrounded 字段无法删除 | `_annotate_ungrounded` 只追加引擎标记，不赦免 | 设计使然，宁可误拦不误放 |
+| ISO 日期过滤 | `_patched_source_numbers` 跳过 `YYYY-MM-DD` 免误读 | 设计选择，非缺陷 |
 
 ---
 
 ## 10. Git 提交记录
 
 ```
+1ec4cf0 build(docker): 同镜像双服务 — needle-http(/extract) 加入 compose
+8cf433c feat(cn): wire P1 数字归一化 into playground 推理入口
+6485c7e feat(cn): P1 中文数字归一化 + 纯提取 HTTP 服务 (翻译不在项目职责内)
+2d4be6b build(docker): self-contained needle-cn image with baked engine cache
+83cf441 docs(grounding): add API integration guide and full test report
 b711f9e test(grounding): add Chinese end-to-end integration tests + playground launcher
 2aa4ddd feat(grounding): add Chinese grounding extension as opt-in plugin
-42bf1f2 test(environments): pin the suite scoring rule and document a red suite (#124)
-1e2072f security: remove pickle fallback to prevent arbitrary code execution (fixes #36) (#131)
-6e33cbd fix: update engine version for compatibility with latest changes
 ```
 
 远程仓库：`git@github.com:chschytzmcy/needle.git`（从 cactus-compute/needle 切换而来）
@@ -601,22 +643,25 @@ b711f9e test(grounding): add Chinese end-to-end integration tests + playground l
 
 ## 11. 文件清单
 
-| 路径 | 行数 | 用途 |
-|------|----|----|
-| `cn_grounding.py` | 283 | 中文 grounding monkey-patch 插件 |
-| `tests/test_cn_grounding.py` | 252 | 中文 grounding 单元测试（41 用例） |
-| `tests/test_cn_grounding_integration.py` | 361 | 中文 grounding 端到端集成测试（14 用例） |
-| `scripts_run_playground.py` | 45 | Playground 启动脚本（自动装补丁 + 修版本号） |
+| 路径 | 用途 |
+|------|----|
+| `cn_grounding.py` | 中文 grounding 插件 + `normalize_cn_numbers`（P1） |
+| `tests/test_cn_grounding.py` | 中文单元（49 用例，含 P1） |
+| `tests/test_cn_grounding_integration.py` | 端到端集成测试（14 用例） |
+| `scripts_run_playground.py` | Playground 启动（补丁+P1+版本修正） |
+| `scripts_run_needle_http.py` | `/extract` 纯提取业务服务（锁/暖机/422/隐私） |
+| `Dockerfile` / `docker-compose.yml` / `docker/` | 同镜像双服务部署 |
+| `API.md` | 业务集成文档（含 4.5 Docker 节） |
 
 ---
 
 ## 12. 结论
 
-- **80/80 测试全部通过**（25 原有 + 41 中文单元 + 14 中文集成）
-- 中文 grounding 三个维度（数字 / 日期 / 相对时间）均按预期工作
-- 英文路径完全无回归
-- HTTP playground 真实查询验证：中文日期 grounding 通过，纯中文数字需配合中英混合 query 绕开引擎限制
-- 插件以 monkey-patch 形式接入，零侵入 needle 源码
+- **88/88 grounding 测试全绿**，全仓 227 passed / 6 skipped，英文路径零回归
+- 中文能力三层全部验证生效：grounding 安全网（数字/日期/相对时间）+ **P1 归一化**（`三十→30` 引擎直接填对，§8.2 复测）
+- **Docker 双服务在线**：playground `:7860`（UI+/complete）与 needle-http `:8081`（/health+/extract），同镜像、36MB 引擎缓存预烘、**运行期零 HF 依赖**
+- extract 契约验证：EN/ZH/P1 正常、非法 body 422、暖机期 /health 503、latency_ms 上报
+- 范围决策已锁定：不做运行时翻译、不做微调；实体拷贝与长句召回为引擎已知上限，留调用方侧处理
 
 ---
 
@@ -676,3 +721,112 @@ curl -s -X POST http://127.0.0.1:7860/complete \
                                               "brightness":{"type":"integer"}},
                                 "required":["room","brightness"]}}]}' | jq .
 ```
+---
+
+## 14. needle-http /extract 与 Docker 双服务验证（2026-09-24）
+
+### 14.1 部署形态
+
+```
+needle-cn:latest (一个镜像, 36MB 引擎缓存预烘, 运行期零 HF 依赖)
+├─ :7860  playground   浏览器 UI + POST /complete    (NEEDLE_SERVICE=playground)
+└─ :8081  needle-http  GET /health + POST /extract   (NEEDLE_SERVICE=extract)
+```
+
+启动：`docker compose up -d --build`；两容器均 `(healthy)`。
+
+### 14.2 /health 与暖机
+
+**请求**：`GET http://127.0.0.1:8081/health`
+
+**响应**：
+```json
+{
+  "status": "ok",
+  "model_loaded": true,
+  "version": "3.0.1",
+  "cn_grounding": true,
+  "extract_count": 0,
+  "last_error": null
+}
+```
+
+暖机日志：`warmup done in 0.2s`（缓存命中，无下载）。暖机完成前该端点返回 503（调用方 circuit breaker 语义）。
+
+### 14.3 /extract 实测
+
+**用例 1 — 英文基线**
+
+请求：
+```json
+{"query": "dim kitchen to 30",
+ "tools": [{"name": "set_lights", "description": "Set room light brightness",
+            "parameters": {"type": "object",
+                           "properties": {"room": {"type": "string"},
+                                          "brightness": {"type": "integer"}},
+                           "required": ["room", "brightness"]}}]}
+```
+
+响应（关键字段）：
+```json
+{
+  "function_calls": [{"name": "set_lights",
+                      "arguments": {"room": "kitchen", "brightness": 30}}],
+  "validation": {"ungrounded": []},
+  "confidence": 0.9,
+  "latency_ms": 376.2
+}
+```
+
+**用例 2 — 纯中文（P1 生效路径）**
+
+请求：`{"query": "把厨房灯调暗到三十", "tools": [同上]}`
+
+响应（关键字段）：
+```json
+{
+  "function_calls": [{"name": "set_lights",
+                      "arguments": {"room": "把厨房灯调暗到30", "brightness": 30}}],
+  "validation": {"ungrounded": []},
+  "latency_ms": 547.9
+}
+```
+
+✅ 服务端对 CJK query 自动执行 P1（`三十`→`30`），数值提取正确。⚠️ `room` 塞整句为引擎实体拷贝弱点（§9 已知限制）。
+
+**用例 3 — 契约错误语义**
+
+请求：`{"query": "", "tools": []}` → **HTTP 422**（非空 query 校验）✅
+
+### 14.4 Docker 内 playground /complete（P1 接线后）
+
+请求：`{"query": "把厨房灯调暗到三十", "tools": [set_lights 中文描述版]}` →
+
+响应：`function_calls=[{room:"把厨房灯调暗到30", brightness:30}]`，`ungrounded=[]`
+
+容器启动日志：
+```
+[entrypoint] service=playground  host=0.0.0.0  port=7860
+[boot] cn_grounding installed: True
+[boot] P1 normalize_cn_numbers wired into Needle._complete
+```
+
+### 14.5 镜像内回归
+
+```bash
+docker run --rm --entrypoint sh \
+  -v $PWD/tests:/tests:ro -v $PWD/cn_grounding.py:/app/cn_grounding.py:ro \
+  needle-cn -c "pip install -q pytest pydantic && python -m pytest /tests/test_grounding.py /tests/test_cn_grounding*.py -q"
+```
+
+结果：**88 passed**（与宿主一致）。
+
+### 14.6 性能实测（容器内，CPU，离线）
+
+| 指标 | playground | extract |
+|---|---|---|
+| 请求延迟（单工具） | < 1s | 376–548 ms |
+| prefill | 436–491 tok/s | ~308 tok/s |
+| decode | 207–213 tok/s | ~222 tok/s |
+| 峰值内存 | 102 MB | 124.5 MB |
+| 启动到 healthy | < 10s | 暖机 0.2s |

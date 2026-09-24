@@ -1,12 +1,14 @@
 # 中文 grounding 扩展 — 业务集成 API 文档
 
 > 目标读者：业务后端 / 应用开发者
-> 适用范围：`cn_grounding.py` (Chinese Grounding Plugin)
-> 版本：v1.0 (2026-09-24)
+> 适用范围：`cn_grounding.py`（插件）+ `scripts_run_needle_http.py`（HTTP 提取服务）+ Docker 部署
+> 版本：v1.1 (2026-09-24)
 
 ---
 
-## 1. 一句话集成
+## 1. 两种集成方式
+
+**方式一：进程内嵌（Python 库）**
 
 ```python
 import cn_grounding
@@ -14,6 +16,15 @@ cn_grounding.install()
 ```
 
 装上后，所有 `needle.Needle` 实例自动获得中文 grounding 能力，无需其他改动。
+
+**方式二：HTTP 服务（推荐生产）**
+
+```bash
+docker compose up -d          # :8081 POST /extract — 中文栈(grounding+P1)服务端内置
+```
+
+调用方 POST `{query, tools}` 拿结构化 `function_calls`，契约详见 §4.5。
+两种方式的中文能力完全一致；范围决策：**运行时翻译与微调不在本项目职责**，纯中文长句的语言侧处理由调用方负责。
 
 ---
 
@@ -74,15 +85,31 @@ assert is_installed()  # True
 
 ### 3.4 独立函数（不依赖 install）
 
-下面三个函数在 `import cn_grounding` 后可直接使用，不依赖 monkey-patch：
+下列函数在 `import cn_grounding` 后可直接使用，不依赖 monkey-patch。**业务侧首先应该用 `normalize_cn_numbers`（P1）**——它是公开的输入归一化：
 
 | 函数 | 签名 | 返回 | 用途 |
 |---|---|---|---|
-| `_parse_cn_number(text)` | `str -> Decimal \| None` | 解析后的十进制数 / `None` | 业务里抽取中文数字 |
+| `normalize_cn_numbers(text)` | `str \| None -> str \| None` | 中文数字已转阿拉伯的文本 | **P1：进 needle/引擎前归一化，让引擎本来就能填对** |
+| `_parse_cn_number(text)` | `str -> Decimal \| None` | 解析后的十进制数 / `None` | 业务里抽取中文数字（被 P1 复用） |
 | `_cn_extract_years(text)` | `str -> set[int]` | 年份集合 | 业务里抽取中文日期年份 |
 | `_cn_section_to_int(text)` | `str -> int \| None` | 整数值 / `None` | 业务里解析纯中文数字段 |
 
-**示例**：
+`normalize_cn_numbers` 的保守规则（详见 TEST_REPORT §3.3 的 17 条用例）：
+
+```python
+from cn_grounding import normalize_cn_numbers
+
+normalize_cn_numbers("把客厅灯调暗到三十")   # '把客厅灯调暗到30'   ← 位值数量, 改写
+normalize_cn_numbers("百分之三十")           # '30%'
+normalize_cn_numbers("三点五折")             # '3.5折'             ← 保留后缀
+normalize_cn_numbers("二零二四年三月五日")   # 原样                 ← 逐字年份链, 不动(交 grounding)
+normalize_cn_numbers("给张三发一条消息")     # 原样                 ← 单字量词/人名, 不动
+normalize_cn_numbers("调暗到30")             # 原样                 ← 阿拉伯直通
+```
+
+> P1 只解决"数值对不对"，日期年份类刻意不动（`二零二四` 按位值 parse 会错成 `4`），它们由 grounding 补丁（`install()`）在输出侧兜底。
+
+底层解析函数示例：
 
 ```python
 from cn_grounding import _parse_cn_number, _cn_extract_years
@@ -254,7 +281,7 @@ curl -s -X POST http://127.0.0.1:8081/extract \
 docker run --rm --entrypoint sh \
   -v $PWD/tests:/tests:ro -v $PWD/cn_grounding.py:/app/cn_grounding.py:ro \
   needle-cn -c "pip install -q pytest pydantic && python -m pytest /tests -q"
-# → 87 passed
+# → 88 passed
 ```
 
 #### 实测性能（CPU，容器内）
@@ -287,9 +314,18 @@ docker run --rm --entrypoint sh \
 | `30 dollars` | 返回 `{Decimal(30)}` | 返回 `{Decimal(30)}`（不变） |
 | `March 5, 2024` | 返回 `{2024}` | 返回 `{2024}`（不变） |
 
+P1 归一化层（`install()` 后使用 `normalize_cn_numbers`，或经 needle-http / playground 入口自动执行）：
+
+| Query 片段 | 进引擎前 | 效果 |
+|---|---|---|
+| `把厨房灯调暗到三十` | `把厨房灯调暗到30` | 引擎直接填对 brightness |
+| `二零二四年` / `一条` / `张三` | **原样不动** | 由 grounding 输出侧兜底（保守规则，见 §3.4） |
+
 ---
 
 ## 6. 错误码与边界
+
+**库层**：
 
 | 场景 | 行为 |
 |---|---|
@@ -300,19 +336,39 @@ docker run --rm --entrypoint sh \
 | 同 query 多种格式 (`"2024年3月5日和2025年4月"`) | 返回 `{2024, 2025}` |
 | query 无相对词 | `_relative_cue` 返回 False（不误判） |
 
+**服务层**（needle-http `/extract`，详见 §13）：
+
+| HTTP 码 | 语义 | 调用方动作 |
+|---|---|---|
+| 422 | body 非法（query 空 / tools 非数组） | 修请求，不必重试 |
+| 503 `engine busy` | 锁排队 >10s | 可重试（带退避） |
+| 503 `loading` | `/health` 暖机未完成 | 视为 down，走 breaker |
+| 502 | 引擎内部错误 | 记 `last_error`，降级到备用提取 |
+
 ---
 
 ## 7. 性能特征
+
+**纯函数开销**：
 
 | 操作 | 复杂度 | 实测耗时 |
 |---|---|---|
 | `_cn_section_to_int` | O(n)，n=字符数 | < 1 μs |
 | `_parse_cn_number` | O(n) + 一次正则 | < 10 μs |
 | `_cn_extract_years` | O(n) + 5 次正则 | < 50 μs |
-| 完整 `install()` | 3 次属性赋值 | < 100 μs |
-| 完整 `uninstall()` | 3 次属性还原 | < 100 μs |
+| `normalize_cn_numbers` | 一次正则替换 | < 100 μs |
+| 完整 `install()` / `uninstall()` | 3 次属性赋值/还原 | < 100 μs |
 
-对典型 query（< 100 字符），整条 grounding 路径增加耗时 < 1 ms。
+对典型 query（< 100 字符），整条 grounding + P1 路径增加耗时 < 1 ms。
+
+**服务实测**（Docker 容器内，CPU，离线）：
+
+| 指标 | extract (:8081) | playground (:7860) |
+|---|---|---|
+| 单请求延迟 | 376–548 ms | < 1 s |
+| prefill / decode | ~308 / ~222 tok/s | 436–491 / 207–213 tok/s |
+| 峰值内存 | 124.5 MB | 102 MB |
+| 暖机 | 0.2s（缓存命中） | < 10s 到 healthy |
 
 ---
 
@@ -430,12 +486,99 @@ if __name__ == "__main__":
         print(f"   {r}\n")
 ```
 
+**HTTP 版**（服务已起时，等价逻辑 3 行）：
+
+```python
+import requests
+
+def handle_user_query(query: str, tools: list) -> dict:
+    r = requests.post("http://127.0.0.1:8081/extract",
+                      json={"query": query, "tools": tools}, timeout=10).json()
+    ok = not r.get("validation", {}).get("ungrounded")
+    return {"calls": r.get("function_calls", []), "ok": ok}
+```
+
 ---
 
-## 12. 支持与反馈
+## 12. HTTP 接口参考（needle-http，:8081）
+
+### 12.1 `GET /health`
+
+模型未暖机完成前返回 **503**（`{"status":"loading","model_loaded":false}`），
+完成后 **200**——直接用作存活探针 / circuit breaker 探测端点。
+
+```json
+{
+  "status": "ok",
+  "model_loaded": true,
+  "version": "3.0.1",
+  "cn_grounding": true,
+  "extract_count": 42,
+  "last_error": null
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `status` | `ok` / `loading` |
+| `model_loaded` | 引擎就绪（暖机=加载+1 次 dummy 推理） |
+| `cn_grounding` | 中文补丁是否在位（部署自检用） |
+| `extract_count` | 成功提取计数 |
+| `last_error` | 最近一次引擎错误摘要（≤200 字符） |
+
+### 12.2 `POST /extract`
+
+**请求体**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `query` | string | ✅ 非空 | 用户请求；含 CJK 时服务端自动 P1 归一化（`三十`→`30`） |
+| `tools` | array\<ToolSchema\> | ✅ 对象数组 | 标准 function schema：`{name, description, parameters(JSON Schema)}` |
+| `system` | string | ❌ | 附加系统事实（如 `date: ...`）；缺省时自动注入当前日期 |
+| `max_new_tokens` | int | ❌ 默认 512 | 生成上限 |
+
+**响应 200**（实测全字段）：
+
+```json
+{
+  "type": "call",
+  "success": true,
+  "error": null, "error_code": null, "reason": null,
+  "function_calls": [
+    {"name": "set_lights", "arguments": {"room": "kitchen", "brightness": 30}}
+  ],
+  "suppressed_calls": [],
+  "reasoning": "Query 'dim kitchen to 30' -> ...",
+  "confidence": 0.9,
+  "prefill_tps": 308.0, "decode_tps": 221.8, "peak_ram_mb": 124.5,
+  "validation": {"ungrounded": [], "negation": false},
+  "latency_ms": 376.2
+}
+```
+
+| 字段 | 业务侧处理建议 |
+|---|---|
+| `function_calls` | 待执行调用列表；**执行权在调用方**（权限/审计/PII 不绕过） |
+| `validation.ungrounded` | **非空 ⇒ 对应字段（`tool.field` 路径）无输入依据，不要执行**，走追问或降级 |
+| `validation.negation` | true 表示引擎判定请求是否定式（"不要开灯"） |
+| `type` | `call`=有调用；`respond`=引擎选择直接答复 |
+| `confidence` | 引擎置信度（0-1），可设阈值二次把关 |
+| `latency_ms` | 服务端耗时（不含网络），监控用 |
+
+**错误响应**：422 / 503（`engine busy`，含 `retry_after_s`）/ 503（暖机）/ 502，见 §6 服务层表。
+
+### 12.3 决策边界（诚实条款）
+
+- **保证**：数值/日期/相对时间类错误绝不静默放行（grounding 拦截）；P1 后常见指令数值可直接提取。
+- **不保证**：纯中文长句的工具选择与实体拷贝（引擎英文训练 + 中文 byte 分词上限，见 TEST_REPORT §9）；语言侧预处理是**调用方职责**（本项目不做运行时翻译）。
+- 建议调用方策略：`ungrounded` 非空或 `type!=call` ⇒ fallback 路径（追问 / 上游 LLM 直接提取）。
+
+---
+
+## 13. 支持与反馈
 
 - 项目仓库：`git@github.com:chschytzmcy/needle.git`
-- 测试报告：`TEST_REPORT.md`
-- 源码：`cn_grounding.py`（283 行，含详细注释）
-- Docker 部署：`Dockerfile` / `docker-compose.yml` / `docker/`（见 4.5 节）
-- 测试用例：`tests/test_cn_grounding.py` (41) + `tests/test_cn_grounding_integration.py` (14)
+- 测试报告：`TEST_REPORT.md`（§14 含 Docker/extract 验证记录）
+- 源码：`cn_grounding.py`（插件 + P1）、`scripts_run_needle_http.py`（提取服务）
+- Docker 部署：`Dockerfile` / `docker-compose.yml` / `docker/`（见 §4.5）
+- 测试用例：`tests/test_cn_grounding.py`（49）+ `tests/test_cn_grounding_integration.py`（14），全套 227 passed
