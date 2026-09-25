@@ -896,3 +896,51 @@ docker run --rm --entrypoint sh \
 ### 16.4 结论
 
 单 needle-http 实例在 30 并发下行为符合预期：不会让客户端傻等，调用方能拿到清晰的 503 + `retry_after_s: 1` 立即重试到其他实例。配合文档 §12.4 的"多实例横向扩展"建议，真要扛高 RPS 就起 3-5 个实例，吞吐线性扩展。
+
+---
+
+## 17. 稳态复测：5 个角度、0 客户端超时（2026-09-25）
+
+§16 修复后第二轮压力复测，覆盖不同负载模式与持续流量：
+
+| 测试 | 用例 | wall | 200 | 503 | 超时 | 异常 |
+|---|---|---|---|---|---|---|
+| 0. 单请求基线 | 1 | 7.6s | 1 | 0 | 0 | 0 |
+| 1. 30 并发 × 3 轮 | 90 (3 轮) | 3.7-7.6s | 7 | 83 | **0** | 0 |
+| 2. 50 并发探上限 | 50 | 7.0s | 3 | 47 | **0** | 0 |
+| 3. 持续 5 req/s × 20s | 100 | 20s | 8 | 92 | **0** | 0 |
+| 4. /health 观测 | — | — | peak=7 | queue=0 | extract=20 | last_error=null |
+| 5. 容器资源 | — | — | CPU=0.10% | **MEM=124MiB**（恒定，无泄漏） | — | — |
+
+50 并发成功请求延迟分布：min=1700ms, p50=3347ms, max=6840ms（说明多个请求能并发完成，验证 to_thread 池生效）。
+
+**关键判定**：
+- 所有响应归类明确（200 或 503），**无 500 / 无连接重置 / 无超时**
+- 503 双闸门（queue full + engine busy）在每轮都触发，调用方可立即拿到 `retry_after_s: 1` 重试
+- 内存稳定在 124MB（与 §14、§15 一致），容器资源占用无增长迹象
+- peak_queue 持续达到 7（>MAX_QUEUE_DEPTH=6），证明并发模型工作正常
+
+**复测命令**（§16 同款 curl + ThreadPoolExecutor，可重复）：
+
+```bash
+# 30 并发, 客户端超时 15s
+python3 -c "
+import concurrent.futures, json, urllib.request, time
+URL='http://127.0.0.1:8081/extract'
+BODY=json.dumps({'query':'dim kitchen to 30',
+  'tools':[{'name':'set_lights','description':'Set room light',
+  'parameters':{'type':'object',
+  'properties':{'room':{'type':'string'},'brightness':{'type':'integer'}},
+  'required':['room','brightness']}}]}).encode()
+def call(i):
+    t0=time.monotonic()
+    try:
+        r=urllib.request.urlopen(urllib.request.Request(URL,BODY,{'Content-Type':'application/json'}),timeout=15)
+        return r.status,(time.monotonic()-t0)*1000
+    except urllib.error.HTTPError as e: return e.code,(time.monotonic()-t0)*1000
+    except: return 0,(time.monotonic()-t0)*1000
+with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
+    res=list(ex.map(call,range(30)))
+ok=sum(1 for r in res if r[0]==200); busy=sum(1 for r in res if r[0]==503); to=sum(1 for r in res if r[0]==0)
+print(f'200={ok} 503={busy} 超时={to}')"
+```
