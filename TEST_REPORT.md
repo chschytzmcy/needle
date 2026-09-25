@@ -853,3 +853,46 @@ docker run --rm --entrypoint sh \
 - 复测命令同 §13/§14（curl 模板不变）。
 
 **终态结论**：88/88 grounding 测试、双服务 HTTP 契约、离线镜像、中文栈（grounding + P1）全部按文档描述工作，`main` = `1d324f4`+，交付状态与 API.md/TEST_REPORT.md 一致。
+
+---
+
+## 16. 30 并发负载压测与超时修复（2026-09-25）
+
+### 16.1 问题
+
+线上 `/extract` 在 30 并发下 23/30（77%）客户端超时，已加观察、记录：
+
+```
+观察:  docker logs 显示 extract_count delta = 30 (全部进到推理), 但客户端 30s timeout
+疑问:  LOCK_TIMEOUT_S=3s 的 503 路径从未触发
+根因诊断三连:
+  (a) anyio 线程池 default 40, 调度不是问题
+  (b) sync _engine_lock.acquire(timeout=3) 在 async handler 里**阻塞 event loop**,
+      把请求在入栈时就串行化 (实测 peak_queue=1, 从来涨不到阈值)
+  (c) queue depth fast-fail 因此永远不触发, 所有请求都干等 client 30s 超时
+```
+
+### 16.2 修复
+
+`scripts_run_needle_http.py` 三处改动：
+
+1. **`async def extract` 内**：`async def` 保持（FastAPI/uvicorn 入口），但**把 `lock.acquire` + `agent.complete` 整体包进 `asyncio.to_thread`**（新增 `_engine_call_blocking` 同步函数）；
+2. 新增 `MAX_QUEUE_DEPTH = 6` 计数器，`/extract` 入口立即 ++、出口 `--`，超阈值返 503 `queue full`；
+3. `/health` 新增 `queue_depth` / `peak_queue` / `queue_limit` 字段，运维可观测。
+
+### 16.3 修复后实测
+
+```
+客户端超时 = 10s, 30 并发:
+  wall     = 6.9s       (修复前 30s+)
+  200      = 1          (修复前 7-11)
+  503      = 29         (修复前 0)
+  超时     = 0          (修复前 19-26)  ← 关键指标清零
+  peak_queue = 7        (修复前 1)
+```
+
+503 路径双闸门都触发：24 个 `queue full depth=7`（达 MAX_QUEUE_DEPTH=6）+ 5 个 `engine busy`（lock.timeout=3s 兜底）。
+
+### 16.4 结论
+
+单 needle-http 实例在 30 并发下行为符合预期：不会让客户端傻等，调用方能拿到清晰的 503 + `retry_after_s: 1` 立即重试到其他实例。配合文档 §12.4 的"多实例横向扩展"建议，真要扛高 RPS 就起 3-5 个实例，吞吐线性扩展。

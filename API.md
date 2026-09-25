@@ -573,6 +573,37 @@ def handle_user_query(query: str, tools: list) -> dict:
 - **不保证**：纯中文长句的工具选择与实体拷贝（引擎英文训练 + 中文 byte 分词上限，见 TEST_REPORT §9）；语言侧预处理是**调用方职责**（本项目不做运行时翻译）。
 - 建议调用方策略：`ungrounded` 非空或 `type!=call` ⇒ fallback 路径（追问 / 上游 LLM 直接提取）。
 
+### 12.4 性能契约
+
+**吞吐上限（单实例）**：needle C 引擎非线程安全，全局 `threading.Lock` 串行化所有 `/extract` 请求。实测：
+
+| 场景 | 单请求 | 单实例吞吐 |
+|---|---|---|
+| 单调用（dim kitchen to 30） | ~1-3s（含 prefill） | ~20-60 req/min |
+| 多调用（turn_on + set_brightness） | ~5-12s | ~5-12 req/min |
+| 30 并发压测（client timeout=30s） | — | ~10/30 通过，**77% 客户端超时** |
+
+**关键默认值**：
+
+| 项 | 默认 | 说明 |
+|---|---|---|
+| `max_new_tokens` | 64 | 单调用响应通常几十 token 足够；业务侧传 0 等同缺省 |
+| `LOCK_TIMEOUT_S` | 3s | 服务端排队超过 3s → 503 `engine busy` |
+| `MAX_QUEUE_DEPTH` | 6 | 同时在飞的 extract 请求数上限；超出 → 503 `queue full` |
+
+**客户端调用约束**：
+
+- 调用方 **必须** 设客户端超时（建议 5-10s），不要被卡死的请求拖死 worker；
+- 收到 503（`engine busy` / `queue full`）必须**立即重试**（带 50-200ms 退避），不要重发同样请求在原队列里；
+- 高并发（>10 RPS）场景起**多实例横向扩展**：compose 复制 `needle-http` service 即可，每个实例独立引擎锁，吞吐线性增长；
+- 单实例内存 ~125MB，3 实例 ≈ 400MB —— 在边缘盒子也扛得住。
+
+**实现细节**：`extract` 是 async handler，但把「加锁 + engine 推理」整体放进 `asyncio.to_thread` 的线程池里跑，避免 `_engine_lock.acquire` 同步阻塞 event loop——否则请求会在入栈时被串行化，`_queue_depth` 永远涨不到阈值（实测修复前 peak_queue=1，修复后 =7）。
+
+**为什么会有 503**：needle 引擎是单线程串行，客户端 timeout 30s 但服务端 30 个并发排队可能要 60s+。queue depth + lock timeout 双闸门 + asyncio.to_thread 三件事一起，让**排队方快速失败**而不是干等 30s —— 调用方能立刻重试到其他实例（多实例）或换降级路径。
+
+**30 并发实测**（修复后）：wall=6.9s, 200=1, 503=29, 超时=0, peak_queue=7。
+
 ---
 
 ## 13. 支持与反馈
