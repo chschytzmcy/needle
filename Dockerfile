@@ -32,7 +32,8 @@ RUN sed -i 's/^\( *\)3: "3\.0\.2",/\13: "3.0.1",/' needle/agent/fetch.py \
     && pip install --no-cache-dir ".[http]"
 
 # ── 中文插件 (grounding + P1) 与两个启动脚本 ──
-COPY cn_grounding.py scripts_run_playground.py scripts_run_needle_http.py ./
+COPY cn_grounding.py cn_grounding_retrieval.py scripts_run_playground.py \
+     scripts_run_needle_http.py ./
 
 # ── 预烘引擎缓存: 启动不碰网络 ──
 COPY docker-cache/cactus-needle/ /root/.cache/cactus-needle/

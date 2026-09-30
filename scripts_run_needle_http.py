@@ -100,6 +100,19 @@ MAX_NEW_TOKENS_CEILING = 1024   # 截断重试上限, 防止无限放大
 
 _CJK_RE = re.compile(r"[㐀-䶿一-鿿]")
 
+# ── 工具检索预筛 (方向 1+2) ──────────────────────────────────────────────
+# needle3 在多工具选择上能力不足, 用 BM25 词法预筛分流:
+#   abstain(低分拒答) / direct(高置信直出, 不调模型) / select(top-K 送模型)
+import cn_grounding_retrieval as tool_retrieval
+
+retrieval_enabled = tool_retrieval.ENABLED
+_stats: dict = {"retrieval": {}}
+print(f"[boot] tool retrieval preselect "
+      f"{'enabled' if retrieval_enabled else 'disabled'} "
+      f"(min={tool_retrieval.MIN_SCORE}, direct>={tool_retrieval.DIRECT_SCORE}"
+      f"/gap>={tool_retrieval.DIRECT_GAP}, top_k={tool_retrieval.TOP_K})",
+      file=sys.stderr)
+
 log = logging.getLogger("needle-http")
 logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -172,6 +185,14 @@ def health():
             "queue_limit": MAX_QUEUE_DEPTH,
             "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
             "truncation_retries": _truncation_retries,
+            "retrieval": {
+                "enabled": retrieval_enabled,
+                "min_score": tool_retrieval.MIN_SCORE,
+                "direct_score": tool_retrieval.DIRECT_SCORE,
+                "direct_gap": tool_retrieval.DIRECT_GAP,
+                "top_k": tool_retrieval.TOP_K,
+                "actions": dict(_stats["retrieval"]),
+            },
             "last_error": _last_error}
 
 
@@ -197,11 +218,56 @@ async def extract(request: Request):  # async + asyncio.to_thread 让阻塞 C �
                             content={"error": "'tools' must be a list of schema objects"})
     system = body.get("system") or ""
     max_new_tokens = int(body.get("max_new_tokens") or DEFAULT_MAX_NEW_TOKENS)
+    retrieval = None
+    if body.get("retrieval") is False:
+        retrieval_mode = False                    # 单次调用可绕过预筛
+    else:
+        retrieval_mode = retrieval_enabled
 
     # ── P1: 中文数字规则归一化 ("三十"→"30"), 零模型零网络 ──
     # 仅含 CJK 时跑; 函数本身保守, 单字量词/人名/年份逐字链不动。
     if _CJK_RE.search(query):
         query = cn_grounding.normalize_cn_numbers(query)
+
+    # ── 工具检索预筛 (方向 1+2): 拒答 / 直出 / 降级 top-K ──
+    # needle3 在 47 选 1 上不可用(实测 33% 英 / 3% 中), 且从不输出"不调用"。
+    # 三条出口都在这里, 详见 cn_grounding_retrieval.py 的标定表。
+    if retrieval_mode:
+        retrieval = tool_retrieval.preselect(query, tools)
+        _stats["retrieval"][retrieval["action"]] = \
+            _stats["retrieval"].get(retrieval["action"], 0) + 1
+
+        if retrieval["action"] == "abstain":
+            # 方向 2: 低分 → 不调模型, 直接返回"无匹配"
+            return JSONResponse(content={
+                "type": "respond", "success": True, "error": None,
+                "error_code": None, "reason": None,
+                "function_calls": [], "suppressed_calls": [],
+                "reasoning": f"no tool matched (top score {retrieval['score']} "
+                             f"< {tool_retrieval.MIN_SCORE})",
+                "confidence": 0.0, "prefill_tps": 0.0, "decode_tps": 0.0,
+                "peak_ram_mb": 0.0, "latency_ms": 0.0,
+                "validation": {"ungrounded": [], "negation": False},
+                "retrieval": retrieval,
+            })
+
+        if retrieval["action"] == "direct":
+            # 高置信 → 不调模型, 直接给工具 (微秒级)
+            tool = retrieval["tool"]
+            return JSONResponse(content={
+                "type": "call", "success": True, "error": None,
+                "error_code": None, "reason": None,
+                "function_calls": [{"name": tool["name"], "arguments": {}}],
+                "suppressed_calls": [],
+                "reasoning": f"lexical match {tool['name']} "
+                             f"(score {retrieval['score']}, gap {retrieval['gap']})",
+                "confidence": 0.0, "prefill_tps": 0.0, "decode_tps": 0.0,
+                "peak_ram_mb": 0.0, "latency_ms": 0.0,
+                "validation": {"ungrounded": [], "negation": False},
+                "retrieval": retrieval,
+            })
+
+        tools = retrieval["tools"]      # 降级: 只把 top-K 交给模型
 
     tools_json = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
 
@@ -238,6 +304,9 @@ async def extract(request: Request):  # async + asyncio.to_thread 让阻塞 C �
                  len(response.get("function_calls") or []),
                  response.get("confidence"), latency_ms)
         response["latency_ms"] = latency_ms
+        if retrieval is not None:
+            # 降级路径的预筛上下文(候选集缩到 top-K), 供调用方观测
+            response["retrieval"] = retrieval
         return response
     finally:
         _queue_depth -= 1
