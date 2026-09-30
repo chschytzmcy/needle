@@ -4,7 +4,7 @@
     GET  /health   → 200 {"status":"ok","model_loaded":true,"version":"3.0.1"}
                      503 暖机未完成 (probe 视为 down → 调用侧 circuit breaker 保持)
     POST /extract  → body {"query": str, "tools": [ToolSchema...],
-                           "system": str?, "max_new_tokens": int? (default 64)}
+                           "system": str?, "max_new_tokens": int? (default 256)}
                      200 {"type","function_calls","confidence","reasoning",
                           "validation","latency_ms"}
                      422 body/tool schema 非法
@@ -21,7 +21,8 @@
     **翻译不属于本服务职责**, 由调用方在进入 /extract 前自行决定。
   - engine 全局单例 + threading.Lock 串行化 (libneedle C 库非线程安全);
     请求排队上限 LOCK_TIMEOUT_S=3s, 超出 → 503 立即重试, 不撞客户端 30s 超时
-  - 默认 max_new_tokens=64 (单调用响应通常几十 token 即可); 业务方传 0 等同缺省
+  - 默认 max_new_tokens=256: 中文 1 汉字=3 token, 模型会在 reasoning 里复述 query,
+    64 会在多字节字符中间截断 → 502; 截断时自动加倍重试一次(见 _truncation_safe_complete)
   - **吞吐上限**: needle 引擎单进程串行, ~8–12 req/min/实例;
     高并发场景起多实例横向扩展 (Docker compose 复制 needle-http service 即可)
   - agent 按 (tools_json, system) 缓存, tools 不变时复用, 避免每请求 re-init
@@ -89,12 +90,51 @@ _extract_count = 0
 _last_error: str | None = None
 _queue_depth = 0                # 当前活的 extract 请求数 (含排队+推理中)
 _peak_queue = 0                 # 累计峰值, 观测用
+_truncation_retries = 0         # 因截断重试的次数 (可观测)
+
+# 默认生成预算。64 是 2026-09-25 为压延迟设的值, 在中文场景下会把生成截断在
+# 多字节字符中间 → buffer.decode 抛 UnicodeDecodeError → 502。中文 1 汉字 = 3
+# token 且模型会在 reasoning 里复述 query, 64 远不够。
+DEFAULT_MAX_NEW_TOKENS = 256
+MAX_NEW_TOKENS_CEILING = 1024   # 截断重试上限, 防止无限放大
 
 _CJK_RE = re.compile(r"[㐀-䶿一-鿿]")
 
 log = logging.getLogger("needle-http")
 logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                     format="%(asctime)s %(levelname)s %(message)s")
+
+
+# ── 截断兜底 (修 502 utf-8 decode error) ─────────────────────────────────
+# needle.Needle._complete 末尾是 `buffer.value.decode("utf-8")` —— 严格解码。
+# 引擎若在 max_new_tokens 处把生成截断在多字节 UTF-8 序列中间(中文 reasoning
+# 尤甚), 这一行抛 UnicodeDecodeError, 调用方看到 502。
+#
+# 引擎输出字段顺序是 type → ... → function_calls → ... → reasoning, 即
+# function_calls 排在 reasoning **之前** —— 被截断的通常只是 reasoning 尾巴,
+# 调用结果本身完整。故重试(而非把坏 JSON 硬 parse)更干净。
+# 不改 needle 源码, 与 cn_grounding 一样走 monkey-patch。
+_orig_complete = needle.Needle._complete
+
+
+def _truncation_safe_complete(self, text, max_new_tokens=512, **kwargs):
+    """Needle._complete 的截断兜底: 截断 → 加倍预算重试一次。"""
+    global _truncation_retries
+    try:
+        return _orig_complete(self, text, max_new_tokens, **kwargs)
+    except UnicodeDecodeError:
+        retry = min(int(max_new_tokens) * 2, MAX_NEW_TOKENS_CEILING)
+        if retry <= int(max_new_tokens):
+            raise                            # 已到上限, 交上层报 502
+        _truncation_retries += 1
+        log.warning("response truncated mid-utf8 (%d→%d tokens), retrying",
+                    int(max_new_tokens), retry)
+        return _orig_complete(self, text, retry, **kwargs)
+
+
+needle.Needle._complete = _truncation_safe_complete
+print(f"[boot] truncation-safe _complete installed "
+      f"(default max_new_tokens={DEFAULT_MAX_NEW_TOKENS})", file=sys.stderr)
 
 
 def _get_agent(tools_json: str, system: str) -> "needle.Needle":
@@ -130,6 +170,8 @@ def health():
             "queue_depth": _queue_depth,
             "peak_queue": _peak_queue,
             "queue_limit": MAX_QUEUE_DEPTH,
+            "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
+            "truncation_retries": _truncation_retries,
             "last_error": _last_error}
 
 
@@ -154,7 +196,7 @@ async def extract(request: Request):  # async + asyncio.to_thread 让阻塞 C �
         return JSONResponse(status_code=422,
                             content={"error": "'tools' must be a list of schema objects"})
     system = body.get("system") or ""
-    max_new_tokens = int(body.get("max_new_tokens") or 64)
+    max_new_tokens = int(body.get("max_new_tokens") or DEFAULT_MAX_NEW_TOKENS)
 
     # ── P1: 中文数字规则归一化 ("三十"→"30"), 零模型零网络 ──
     # 仅含 CJK 时跑; 函数本身保守, 单字量词/人名/年份逐字链不动。
