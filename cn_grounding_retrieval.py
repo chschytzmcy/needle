@@ -40,10 +40,12 @@ DIRECT_GAP = float(os.environ.get("NEEDLE_RETRIEVAL_DIRECT_GAP", "5.0"))
 # 直出仅限无必填参数的工具(否则 arguments 为空, 调用方拿不到可用调用)
 DIRECT_MAX_REQUIRED = int(os.environ.get("NEEDLE_RETRIEVAL_DIRECT_MAX_REQUIRED", "0"))
 # 直出时是否允许带必填参数的工具(会产出 arguments={} 的调用)。
-# 这是**产品决策**, 不是技术开关: 调用方能否接受"名字对、参数空"再去追问用户?
-#   0 (默认, 安全): 只直出无必填参数的工具, 其余交模型抽参
-#   1 (激进)      : 任何高置信匹配都直出; 名字正确率显著提升, 但参数全空
-DIRECT_ALLOW_REQUIRED = os.environ.get("NEEDLE_RETRIEVAL_DIRECT_ALLOW_ARGS", "0") == "1"
+# 这是**产品决策**: 调用方能否接受"名字对、参数空"再去追问用户?
+#   1 (默认) : 任何高置信匹配都直出; 名字正确率显著提升(实测 EN 72% / CN 64%),
+#              但带必填参数的工具会返回 arguments={} —— **调用方需能识别空参并追问**
+#   0 (保守) : 只直出无必填参数的工具, 其余交模型抽参 (EN 69% / CN 49%)
+# 现状: dsh-edge-agent 侧支持空参追问, 故默认 1。
+DIRECT_ALLOW_REQUIRED = os.environ.get("NEEDLE_RETRIEVAL_DIRECT_ALLOW_ARGS", "1") == "1"
 # 送模型的候选数。BM25 top-5 召回 92%(英)/97%(中)
 TOP_K = int(os.environ.get("NEEDLE_RETRIEVAL_TOP_K", "5"))
 # 检索无有效结果时是否回退到全量工具集(False = 宁可拒答也不乱选)

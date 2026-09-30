@@ -43,7 +43,7 @@ services:
       NEEDLE_RETRIEVAL_DIRECT_SCORE: "10.0"    # 直出分数线
       NEEDLE_RETRIEVAL_DIRECT_GAP: "5.0"       # 直出分差线
       NEEDLE_RETRIEVAL_TOP_K: "5"              # 送模型的候选数
-      NEEDLE_RETRIEVAL_DIRECT_ALLOW_ARGS: "${NEEDLE_RETRIEVAL_DIRECT_ALLOW_ARGS:-0}"  # 1=带必填参数也直出
+      NEEDLE_RETRIEVAL_DIRECT_ALLOW_ARGS: "${NEEDLE_RETRIEVAL_DIRECT_ALLOW_ARGS:-1}"  # 1=带必填参数也直出
       # NEEDLE_WEIGHTS: /weights/my_tuned.cact
     restart: unless-stopped
     healthcheck:
