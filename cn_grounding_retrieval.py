@@ -39,6 +39,11 @@ DIRECT_SCORE = float(os.environ.get("NEEDLE_RETRIEVAL_DIRECT_SCORE", "10.0"))
 DIRECT_GAP = float(os.environ.get("NEEDLE_RETRIEVAL_DIRECT_GAP", "5.0"))
 # 直出仅限无必填参数的工具(否则 arguments 为空, 调用方拿不到可用调用)
 DIRECT_MAX_REQUIRED = int(os.environ.get("NEEDLE_RETRIEVAL_DIRECT_MAX_REQUIRED", "0"))
+# 直出时是否允许带必填参数的工具(会产出 arguments={} 的调用)。
+# 这是**产品决策**, 不是技术开关: 调用方能否接受"名字对、参数空"再去追问用户?
+#   0 (默认, 安全): 只直出无必填参数的工具, 其余交模型抽参
+#   1 (激进)      : 任何高置信匹配都直出; 名字正确率显著提升, 但参数全空
+DIRECT_ALLOW_REQUIRED = os.environ.get("NEEDLE_RETRIEVAL_DIRECT_ALLOW_ARGS", "0") == "1"
 # 送模型的候选数。BM25 top-5 召回 92%(英)/97%(中)
 TOP_K = int(os.environ.get("NEEDLE_RETRIEVAL_TOP_K", "5"))
 # 检索无有效结果时是否回退到全量工具集(False = 宁可拒答也不乱选)
@@ -163,12 +168,13 @@ def preselect(query: str, tools: list[dict]) -> dict:
         return {"action": "abstain", "tools": [], "tool": None,
                 "score": round(top, 3), "gap": round(gap, 3), "ranked": ranked}
 
-    # 2. 直出 (高置信 + 无必填参数)
+    # 2. 直出 (高置信 + 参数策略允许)
     if top >= DIRECT_SCORE and gap >= DIRECT_GAP:
         cand = by_name[top_name]
-        if len(required_params(cand)) <= DIRECT_MAX_REQUIRED:
+        if DIRECT_ALLOW_REQUIRED or len(required_params(cand)) <= DIRECT_MAX_REQUIRED:
             return {"action": "direct", "tools": [cand], "tool": cand,
-                    "score": round(top, 3), "gap": round(gap, 3), "ranked": ranked}
+                    "score": round(top, 3), "gap": round(gap, 3), "ranked": ranked,
+                    "note": ("empty-args" if required_params(cand) else None)}
         # 有必填参数 → 仍要模型抽参, 但候选集可以更小
         return {"action": "select", "tools": [cand], "tool": None,
                 "score": round(top, 3), "gap": round(gap, 3), "ranked": ranked}

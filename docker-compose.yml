@@ -37,6 +37,13 @@ services:
       NEEDLE_HOST: "0.0.0.0"
       NEEDLE_PORT: "8081"
       NEEDLE_TELEMETRY: "0"      # 隐私: 不发匿名计数
+      # ── 工具检索预筛 (方向 1+2), 阈值标定见 cn_grounding_retrieval.py ──
+      NEEDLE_RETRIEVAL: "1"                    # 总开关
+      NEEDLE_RETRIEVAL_MIN_SCORE: "4.0"        # 低于此分 → 拒答(方向 2)
+      NEEDLE_RETRIEVAL_DIRECT_SCORE: "10.0"    # 直出分数线
+      NEEDLE_RETRIEVAL_DIRECT_GAP: "5.0"       # 直出分差线
+      NEEDLE_RETRIEVAL_TOP_K: "5"              # 送模型的候选数
+      NEEDLE_RETRIEVAL_DIRECT_ALLOW_ARGS: "${NEEDLE_RETRIEVAL_DIRECT_ALLOW_ARGS:-0}"  # 1=带必填参数也直出
       # NEEDLE_WEIGHTS: /weights/my_tuned.cact
     restart: unless-stopped
     healthcheck:

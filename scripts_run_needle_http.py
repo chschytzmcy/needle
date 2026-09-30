@@ -110,7 +110,8 @@ _stats: dict = {"retrieval": {}}
 print(f"[boot] tool retrieval preselect "
       f"{'enabled' if retrieval_enabled else 'disabled'} "
       f"(min={tool_retrieval.MIN_SCORE}, direct>={tool_retrieval.DIRECT_SCORE}"
-      f"/gap>={tool_retrieval.DIRECT_GAP}, top_k={tool_retrieval.TOP_K})",
+      f"/gap>={tool_retrieval.DIRECT_GAP}, top_k={tool_retrieval.TOP_K}"
+      f", allow_args={tool_retrieval.DIRECT_ALLOW_REQUIRED})",
       file=sys.stderr)
 
 log = logging.getLogger("needle-http")
